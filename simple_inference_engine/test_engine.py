@@ -3,7 +3,7 @@ import torch
 from model import GPT
 from inference_engine import Inference_Engine
 
-model=GPT(768,12,128,50257,12).to('cuda')
+model=GPT(768,1,128,50257,12).to('cuda')
 model.load_state_dict(torch.load("model-1k.pt",weights_only=True))
 model.eval()
 
