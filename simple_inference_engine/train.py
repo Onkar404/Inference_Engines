@@ -3,7 +3,7 @@ import torch
 import math 
 import tiktoken
 
-model=GPT(768,12,128,50257,12).to('cuda')
+model=GPT(768,1,128,50257,12).to('cuda')
 
 with open("input.txt", "r", encoding="utf-8") as f:
     text = f.read()
