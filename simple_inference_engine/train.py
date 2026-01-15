@@ -2,7 +2,7 @@ from model import GPT
 import torch 
 import math 
 import tiktoken
-
+# !!! model should be single head because inference engine is single head 
 model=GPT(768,1,128,50257,12).to('cuda')
 
 with open("input.txt", "r", encoding="utf-8") as f:
