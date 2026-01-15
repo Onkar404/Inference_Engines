@@ -2,7 +2,7 @@ import tiktoken
 from model import GPT
 import torch
 
-model=GPT(768,12,128,50257,12).to('cuda')
+model=GPT(768,1,128,50257,12).to('cuda')
 
 model.load_state_dict(torch.load("model-1k.pt"))
 model.eval()
