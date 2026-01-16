@@ -146,7 +146,7 @@ class Inference_Engine:
                     q.squeeze(0),                               # [H, D]
                     torch.stack([c.k_pages for c in self.kv_cache[layer_id]]),
                     torch.stack([c.v_pages for c in self.kv_cache[layer_id]]),
-                    self.block_tables[layer_id][:t]             # [t]
+                    self.block_tables[layer_id]          # [t]
                 )
                 attn_out = attn_out.reshape(1, self.d_model)    
                 
