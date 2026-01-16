@@ -73,7 +73,7 @@ class Inference_Engine:
         prompt_tokens = prompt_tokens.to(device)
         T = prompt_tokens.shape[0]
 
-        # ---------- 1. NORMAL FORWARD (FlashAttention path) ----------
+     
         tok_embs = self.tok_emb(prompt_tokens.unsqueeze(0))     # [1, T, D]
         pos = torch.arange(T, device=device)
         pos_embs = self.pos_emb(pos)                             # [T, D]
@@ -86,7 +86,7 @@ class Inference_Engine:
         x = self.ln_f(x)                                         # [1, T, D]
         self.last_hidden = x[:, -1, :]                            # [1, D]
 
-        # ---------- 2. WRITE KV CACHE (NO ATTENTION) ----------
+   
         for t in range(T):
             for layer_id, block in enumerate(self.blocks):
 
@@ -103,13 +103,13 @@ class Inference_Engine:
                 k = k.view(1, self.num_heads, self.head_dim)
                 v = v.view(1, self.num_heads, self.head_dim)
 
-                # block table update (ONCE per token per layer)
+                
                 seq_t = self.seq_lens[layer_id]
                 if seq_t % self.kv_cache[layer_id][0].page_size == 0:
                     page_id = self.kv_cache[layer_id][0].free_pages.pop(0)
                 self.block_tables[layer_id][seq_t] = page_id
 
-                # write KV per head
+
                 for h_id in range(self.num_heads):
                     self.kv_cache[layer_id][h_id].append(
                         seq_t,
@@ -133,17 +133,15 @@ class Inference_Engine:
 
                 t = self.seq_lens[layer_id]
 
-                # ---- QKV ----
                 x = block.ln1(hidden)
                 qkv = block.attn.c_attn(x)
                 q, k, v = qkv.chunk(3, dim=-1)
 
-                # reshape to heads
                 q = q.view(1, self.num_heads, self.head_dim)
                 k = k.view(1, self.num_heads, self.head_dim)
                 v = v.view(1, self.num_heads, self.head_dim)
 
-                # ---- PAGED ATTENTION (READ ONLY) ----
+   
                 attn_out = paged_attention(
                     q.squeeze(0),                               # [H, D]
                     torch.stack([c.k_pages for c in self.kv_cache[layer_id]]),
@@ -158,7 +156,7 @@ class Inference_Engine:
                 hidden = hidden + attn_out
                 hidden = hidden + block.ffnn(block.ln2(hidden))
 
-                # ---- WRITE KV (NO READ) ----
+    
                 if t % self.PAGE_SIZE == 0:
                     page_id = self.kv_cache[layer_id][0].free_pages.pop(0)
                     self.kv_cache[layer_id][0].current_page = page_id
@@ -177,7 +175,7 @@ class Inference_Engine:
 
                 self.seq_lens[layer_id] += 1
 
-            # ---- sample token ----
+
             logits = self.head(self.ln_f(hidden)).squeeze(0)
             next_token = top_k_sample(logits, k=50)
             generated_tokens.append(next_token.item())
@@ -225,8 +223,7 @@ class PagedKVcachelayer:
         self.current_page = None
 
     def append(self, t, page_id, k, v):
-        # t: global token index
-        # page_id: allocated by inference engine
+        
 
         if t % self.page_size == 0:
             self.current_page = page_id
