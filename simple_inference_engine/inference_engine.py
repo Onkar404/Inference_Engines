@@ -26,13 +26,15 @@ class Inference_Engine:
 
         self.ln_f=model.transformer.ln_f
         self.head=model.transformer.head
+        self.num_heads = self.model.transformer.blocks[0].attn.H
+        self.head_dim = self.model.transformer.blocks[0].attn.d // self.num_heads
 
         self.kv_cache = None
         self.seq_len = None
 
     def init_kv_cache(self):
         '''will initilaize kv cache for all layers can be accesed as kv_cache[i] for layer i'''
-        self.kv_cache=[KV_cache_Layer() for _ in range(self.num_layers)]
+        self.kv_cache = [ [KV_cache_Layer() for _ in range(self.num_heads)] for _ in range(self.num_layers)]
 
 
 
@@ -57,22 +59,41 @@ class Inference_Engine:
 
                 x = block.ln1(hidden)
                 qkv=block.attn.c_attn(x)
-                q,k,v=qkv.chunk(3,dim=-1)
+                q, k, v = qkv.chunk(3, dim=-1)
+                q = q.view(1, self.num_heads, self.head_dim)
+                k = k.view(1, self.num_heads, self.head_dim)
+                v = v.view(1, self.num_heads, self.head_dim)
 
-                k_cache,v_cache=self.kv_cache[layer_id].get()
+                head_outputs = []
 
-                if k_cache is not None:
-                    attn_out=causal_attention(q,k_cache,v_cache)
-                else:
-                    attn_out = q
+                for h in range(self.num_heads):
+                    cache = self.kv_cache[layer_id][h]
 
-                attn_out=block.attn.c_proj(attn_out)
+                    q_h = q[:, h, :]   
+                    k_h = k[:, h, :]
+                    v_h = v[:, h, :]
+
+                    k_cache, v_cache = cache.get()
+
+                    if k_cache is not None:
+                        out_h = causal_attention(q_h, k_cache, v_cache)
+                    else:
+                        out_h = q_h
+
+                    head_outputs.append(out_h)
+                    cache.append(k_h, v_h)
+
+                # concat heads → [1, D]
+                attn_out = torch.cat(head_outputs, dim=-1)
+                attn_out = block.attn.c_proj(attn_out)
+
+                    
 
                 hidden= hidden + attn_out
 
                 hidden= hidden + block.ffnn(block.ln2(hidden))
 
-                self.kv_cache[layer_id].append(k,v)
+                
 
             seq_len+=1
 
@@ -86,52 +107,57 @@ class Inference_Engine:
 
 
 
-    def decode(self,max_tokens):
-        generated_tokens=[]
-        device=self.device
-        hidden=self.last_hidden
+    def decode(self, max_tokens):
+        generated_tokens = []
+        device = self.device
+        hidden = self.last_hidden
 
         for step in range(max_tokens):
 
-            if self.seq_len >= self.block_size:
-    # keep only last (block_size - 1) tokens in KV cache
-                for layer in self.kv_cache:
-                    layer.k = layer.k[-(self.block_size - 1):]
-                    layer.v = layer.v[-(self.block_size - 1):]
-                self.seq_len = self.block_size - 1
+            for layer_id, block in enumerate(self.blocks):
+                x = block.ln1(hidden)
 
+                qkv = block.attn.c_attn(x)
+                q, k, v = qkv.chunk(3, dim=-1)
 
-            for layer_id ,block in enumerate(self.blocks):
-                x=block.ln1(hidden)
+                q = q.view(1, self.num_heads, self.head_dim)
+                k = k.view(1, self.num_heads, self.head_dim)
+                v = v.view(1, self.num_heads, self.head_dim)
 
-                qkv=block.attn.c_attn(x)
-                q,k,v=qkv.chunk(3,dim=-1)
+                head_outputs = []
 
-                k_cache,v_cache=self.kv_cache[layer_id].get()
+                for h in range(self.num_heads):
+                    cache = self.kv_cache[layer_id][h]
 
-                attn_out=causal_attention(q,k_cache,v_cache)
+                    q_h = q[:, h, :]
+                    k_h = k[:, h, :]
+                    v_h = v[:, h, :]
 
-                attn_out=block.attn.c_proj(attn_out)
+                    k_cache, v_cache = cache.get()
 
-                hidden= hidden + attn_out
+                    if k_cache is not None:
+                        out_h = causal_attention(q_h, k_cache, v_cache)
+                    else:
+                        out_h = q_h
 
-                hidden= hidden + block.ffnn(block.ln2(hidden))
+                    head_outputs.append(out_h)
+                
+                for h in range(self.num_heads):
+                    self.kv_cache[layer_id][h].append(
+                        k[:, h, :],
+                        v[:, h, :]
+                    )
 
-                self.kv_cache[layer_id].append(k,v)
+                attn_out = torch.cat(head_outputs, dim=-1)
+                attn_out = block.attn.c_proj(attn_out)
 
-            temperature=1.0
+                hidden = hidden + attn_out
+                hidden = hidden + block.ffnn(block.ln2(hidden))
 
-            logits=self.head(self.ln_f(hidden))
-            logits=logits.squeeze(0)
-            # next_token=torch.argmax(logits,dim=-1)
-            probs = F.softmax(logits / temperature, dim=-1)
-            
-            # next_token = torch.multinomial(probs, num_samples=1)
+            logits = self.head(self.ln_f(hidden)).squeeze(0)
             next_token = top_k_sample(logits, k=50)
-
             generated_tokens.append(next_token.item())
 
-                    # ---- prepare next step ----
             hidden = self.tok_emb(next_token)
             pos = self.pos_emb(torch.tensor(self.seq_len, device=device))
             hidden = hidden + pos
@@ -189,21 +215,17 @@ class KV_cache_Layer:
 
 
 def causal_attention(Q, K, V):
-    """
-    Q: [1, D]
-    K: [T, 1, D]
-    V: [T, 1, D]
-    """
-    # squeeze batch dim
-    Q = Q.squeeze(0)        # [D]
-    K = K.squeeze(1)        # [T, D]
-    V = V.squeeze(1)        # [T, D]
+    
+    
+    Q = Q.squeeze(0)        
+    K = K.squeeze(1)        
+    V = V.squeeze(1)        
 
-    scores = torch.matmul(Q, K.T) / (Q.shape[-1] ** 0.5)  # [T]
-    attn = torch.softmax(scores, dim=-1)                  # [T]
-    out = torch.matmul(attn, V)                            # [D]
+    scores = torch.matmul(Q, K.T) / (Q.shape[-1] ** 0.5)  
+    attn = torch.softmax(scores, dim=-1)                  
+    out = torch.matmul(attn, V)                           
 
-    return out.unsqueeze(0)  # [1, D]
+    return out.unsqueeze(0)  
 
     
 def top_k_sample(logits, k=50):
@@ -212,3 +234,4 @@ def top_k_sample(logits, k=50):
     idx = torch.multinomial(probs, 1)
     return indices[idx]
     
+
