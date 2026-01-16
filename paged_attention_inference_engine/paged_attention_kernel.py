@@ -12,7 +12,6 @@ import torch
 def paged_attention_kernel(q_ptr,
             k_cache_ptr,v_cache_ptr,
             block_table_ptr,o_ptr,seq_len,
-            stride_block_h,
             stride_kh,stride_vh,stride_qh,
             stride_kp,stride_ks,stride_kd,
             stride_vp,stride_vs,stride_vd,
@@ -35,7 +34,7 @@ def paged_attention_kernel(q_ptr,
 
             for t in tl.static_range(0,MAX_SEQ_LEN):
                 valid = t < seq_len
-                page_id = tl.load(block_table_ptr + head*stride_block_h + t )
+                page_id = tl.load(block_table_ptr + t )
                 page_id = tl.where(valid, page_id, 0)
                 slot = t % PAGE_SIZE
 
@@ -70,7 +69,6 @@ def paged_attention(q,k_pages,v_pages,block_table):
     o=torch.empty_like(q)
     T=block_table.shape[-1]
     stride_qh=q.stride(0)
-    stride_block_h=block_table.stride(0)
     stride_oh=o.stride(0)
     stride_kh,stride_kp,stride_ks,stride_kd=k_pages.stride(0),k_pages.stride(1),k_pages.stride(2),k_pages.stride(3)
     stride_vh,stride_vp,stride_vs,stride_vd=v_pages.stride(0),v_pages.stride(1),v_pages.stride(2),v_pages.stride(3)
@@ -82,7 +80,6 @@ def paged_attention(q,k_pages,v_pages,block_table):
     paged_attention_kernel[grid](q,
             k_pages,v_pages,
             block_table,o,T,
-            stride_block_h,
             stride_kh,stride_vh,stride_qh,
             stride_kp,stride_ks,stride_kd,
             stride_vp,stride_vs,stride_vd,
