@@ -146,7 +146,7 @@ class Inference_Engine:
                     q.squeeze(0),                               # [H, D]
                     torch.stack([c.k_pages for c in self.kv_cache[layer_id]]),
                     torch.stack([c.v_pages for c in self.kv_cache[layer_id]]),
-                    self.block_tables[layer_id]          # [t]
+                    self.block_tables[layer_id][:t]        # [t]
                 )
                 attn_out = attn_out.reshape(1, self.d_model)    
                 
@@ -204,10 +204,6 @@ class Inference_Engine:
 
 
 
-
-
-
-
 class PagedKVcachelayer:
     def __init__(self, num_pages, page_size, head_dim, device):
         self.page_size = page_size
@@ -233,7 +229,13 @@ class PagedKVcachelayer:
         self.v_pages[self.current_page, slot] = v.squeeze(0)
 
 
-        
+
+
+def top_k_sample(logits, k=50):
+    values, indices = torch.topk(logits, k)
+    probs = torch.softmax(values, dim=-1)
+    idx = torch.multinomial(probs, 1)
+    return indices[idx]
             
 
 
