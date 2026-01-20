@@ -2,6 +2,7 @@
 import torch 
 import torch.nn.functional as F
 from paged_attention_kernel import paged_attention
+from utils_kernels import triton_kv_write
 
 
 class Inference_Engine:
@@ -67,73 +68,79 @@ class Inference_Engine:
   
 
 
- 
     def prefill(self, prompt_tokens):
         device = self.device
-        prompt_tokens = prompt_tokens.to(device)
-        T = prompt_tokens.shape[0]
+        tokens = prompt_tokens.to(device)
+        T = tokens.shape[0]
 
-     
-        tok_embs = self.tok_emb(prompt_tokens.unsqueeze(0))     # [1, T, D]
-        pos = torch.arange(T, device=device)
-        pos_embs = self.pos_emb(pos)                             # [T, D]
+        # embeddings
+        tok_emb = self.tok_emb(tokens)
+        pos_emb = self.pos_emb(torch.arange(T, device=device))
+        x = tok_emb + pos_emb                     # [T, D_model]
 
-        x = tok_embs + pos_embs.unsqueeze(0)                     # [1, T, D]
+        self.init_kv_cache()
 
-        for block in self.blocks:
-            x = block(x)
+        for layer_id, block in enumerate(self.blocks):
 
-        x = self.ln_f(x)                                         # [1, T, D]
-        self.last_hidden = x[:, -1, :]                            # [1, D]
+            # 1. LayerNorm
+            x_ln = block.ln1(x)                   # [T, D_model]
 
-   
-        for t in range(T):
-            for layer_id, block in enumerate(self.blocks):
+            # 2. QKV projection
+            qkv = block.attn.c_attn(x_ln)
+            q, k, v = qkv.chunk(3, dim=-1)
 
-                # project only (cheap)
-                hidden_t = x[:, t:t+1, :] if False else None
-                # better: recompute minimal projection
-                tok = prompt_tokens[t].unsqueeze(0)
-                h = self.tok_emb(tok) + self.pos_emb(torch.tensor(t, device=device))
-                h = block.ln1(h)
+            q = q.view(T, self.num_heads, self.head_dim)
+            k = k.view(T, self.num_heads, self.head_dim)
+            v = v.view(T, self.num_heads, self.head_dim)
 
-                qkv = block.attn.c_attn(h)
-                q, k, v = qkv.chunk(3, dim=-1)
+            for t in range(T):
+                self.block_tables[layer_id][t] = t // self.PAGE_SIZE
 
-                k = k.view(1, self.num_heads, self.head_dim)
-                v = v.view(1, self.num_heads, self.head_dim)
+            # 3. WRITE KV CACHE (your Triton kernel)
+            K_pages = torch.stack([c.k_pages for c in self.kv_cache[layer_id]])
+            V_pages = torch.stack([c.v_pages for c in self.kv_cache[layer_id]])
 
-                
-                seq_t = self.seq_lens[layer_id]
-                if seq_t % self.kv_cache[layer_id][0].page_size == 0:
-                    page_id = self.kv_cache[layer_id][0].free_pages.pop(0)
-                self.block_tables[layer_id][seq_t] = page_id
+            triton_kv_write(
+                k,
+                v,
+                K_pages,
+                V_pages,
+                self.block_tables[layer_id],
+            )
+            self.seq_lens[layer_id] = T
 
+            # 4. ATTENTION (FlashAttention on projections)
+            attn_out = torch.nn.functional.scaled_dot_product_attention(
+                q.transpose(0, 1),
+                k.transpose(0, 1),
+                v.transpose(0, 1),
+                is_causal=True,
+            ).transpose(0, 1).contiguous()
 
-                for h_id in range(self.num_heads):
-                    self.kv_cache[layer_id][h_id].append(
-                        seq_t,
-                        page_id,
-                        k[:, h_id],
-                        v[:, h_id]
-                    )
+            attn_out = attn_out.view(T, -1)
 
-                self.seq_lens[layer_id] += 1
+            # 5. Output projection + residual
+            x = x + block.attn.c_proj(attn_out)
 
+            # 6. FFN
+            x = x + block.ffnn(block.ln2(x))
+
+        self.last_hidden = x[-1].unsqueeze(0)
 
 
     def decode(self, max_tokens):
-        PAGE_SIZE=self.PAGE_SIZE
+        PAGE_SIZE = self.PAGE_SIZE
         generated_tokens = []
-        hidden = self.last_hidden
+        hidden = self.last_hidden                     # [1, D]
 
         for _ in range(max_tokens):
 
             for layer_id, block in enumerate(self.blocks):
 
-                t = self.seq_lens[layer_id]
+                t = self.seq_lens[layer_id]           # current token index
 
-                x = block.ln1(hidden)
+                # ---- QKV projection ----
+                x = block.ln1(hidden)                 # [1, D]
                 qkv = block.attn.c_attn(x)
                 q, k, v = qkv.chunk(3, dim=-1)
 
@@ -141,47 +148,42 @@ class Inference_Engine:
                 k = k.view(1, self.num_heads, self.head_dim)
                 v = v.view(1, self.num_heads, self.head_dim)
 
-   
+                # ---- PAGED ATTENTION (READ ONLY) ----
                 attn_out = paged_attention(
-                    q.squeeze(0),                               # [H, D]
+                    q.squeeze(0),                     # [H, D]
                     torch.stack([c.k_pages for c in self.kv_cache[layer_id]]),
                     torch.stack([c.v_pages for c in self.kv_cache[layer_id]]),
-                    self.block_tables[layer_id][:t]        # [t]
-                )
-                attn_out = attn_out.reshape(1, self.d_model)    
-                
+                    self.block_tables[layer_id][:t],  # history only
+                )                                     # [H, D]
 
-
+                attn_out = attn_out.view(1, self.d_model)
                 attn_out = block.attn.c_proj(attn_out)
+
                 hidden = hidden + attn_out
                 hidden = hidden + block.ffnn(block.ln2(hidden))
 
-    
-                if t % self.PAGE_SIZE == 0:
-                    page_id = self.kv_cache[layer_id][0].free_pages.pop(0)
-                    self.kv_cache[layer_id][0].current_page = page_id
-                else:
-                    page_id = self.kv_cache[layer_id][0].current_page
+                # ---- WRITE KV FOR NEW TOKEN (PERMANENT LOGIC) ----
+                page_id = t // PAGE_SIZE
+                slot = t % PAGE_SIZE
 
+                # fill block table ONCE for this token
                 self.block_tables[layer_id][t] = page_id
 
+                # write KV
                 for h in range(self.num_heads):
-                    self.kv_cache[layer_id][h].append(
-                        t,
-                        page_id,
-                        k[:, h],
-                        v[:, h]
-                    )
+                    self.kv_cache[layer_id][h].k_pages[page_id, slot] = k[:, h]
+                    self.kv_cache[layer_id][h].v_pages[page_id, slot] = v[:, h]
 
                 self.seq_lens[layer_id] += 1
 
-
+            # ---- sample next token ----
             logits = self.head(self.ln_f(hidden)).squeeze(0)
-            next_token = top_k_sample(logits, k=50)
+            next_token = torch.argmax(logits)
             generated_tokens.append(next_token.item())
 
-            hidden = self.tok_emb(next_token) + self.pos_emb(
-                torch.tensor(self.seq_lens[0], device=self.device)
+            hidden = (
+                self.tok_emb(next_token)
+                + self.pos_emb(torch.tensor(self.seq_lens[0], device=self.device))
             )
 
         return generated_tokens
@@ -195,12 +197,16 @@ class Inference_Engine:
             dtype=torch.long
         )
 
-        self.init_kv_cache()
+
         self.prefill(token_ids)
 
         out_tokens = self.decode(max_tokens)
 
         return self.tokenizer.decode(out_tokens)
+
+
+
+
 
 
 
@@ -219,7 +225,8 @@ class PagedKVcachelayer:
         self.current_page = None
 
     def append(self, t, page_id, k, v):
-        
+        # t: global token index
+        # page_id: allocated by inference engine
 
         if t % self.page_size == 0:
             self.current_page = page_id
@@ -228,16 +235,30 @@ class PagedKVcachelayer:
         self.k_pages[self.current_page, slot] = k.squeeze(0)
         self.v_pages[self.current_page, slot] = v.squeeze(0)
 
-
-
-
+      
+    
 def top_k_sample(logits, k=50):
     values, indices = torch.topk(logits, k)
     probs = torch.softmax(values, dim=-1)
     idx = torch.multinomial(probs, 1)
     return indices[idx]
-            
+    
 
 
 
-        
+def project_qkv(x, qkv_proj, num_heads):
+    """
+    x: [T, D_model]
+    returns Q, K, V: [T, H, D]
+    """
+    T, D_model = x.shape
+    qkv = qkv_proj(x)              # [T, 3*D_model]
+    q, k, v = qkv.chunk(3, dim=-1)
+
+    head_dim = D_model // num_heads
+
+    q = q.view(T, num_heads, head_dim)
+    k = k.view(T, num_heads, head_dim)
+    v = v.view(T, num_heads, head_dim)
+
+    return q, k, v
